@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import FluxPipeline, StableDiffusionPipeline, StableDiffusionXLPipeline
+from diffusers import FluxPipeline, StableDiffusionPipeline, StableDiffusionXLPipeline, StableDiffusion3Pipeline
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift, retrieve_timesteps as retrieve_flux_timesteps
 from tqdm.auto import tqdm
 
@@ -25,6 +25,7 @@ from utils.flux2_klein_utils import (
 )
 from utils.sd_utils import esd_sd_call
 from utils.sdxl_utils import esd_sdxl_call
+from utils.sd35_utils import esd_sd35_call
 
 
 TARGET_MODULE_TYPES = {
@@ -67,7 +68,7 @@ class ESDConfig:
     device: str = "cuda:0"
     torch_dtype: torch.dtype = torch.bfloat16
     inference_guidance_scale: Optional[float] = None
-    max_sequence_length: int = 77
+    max_sequence_length: int = 512
     gradient_checkpointing: bool = False
     allow_tf32: bool = False
 
@@ -1143,11 +1144,190 @@ class Flux2KleinESDAdapter(BaseESDAdapter):
         return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
 
 
+class StableDiffusion35ESDAdapter(BaseESDAdapter):
+    family = "sd35"
+    component_attr = "transformer"
+    default_base_model_id = "stabilityai/stable-diffusion-3.5-medium"  # or large
+    default_save_path = "esd-models/sd35/"
+
+    def normalize_train_method(self, train_method: str) -> str:
+        aliases = {
+            "xattn": "esd-x",
+            "xattn-strict": "esd-x-strict",
+            "esd-x": "esd-x",
+            "esd-x-strict": "esd-x-strict",
+        }
+        normalized = aliases.get(train_method)
+        if normalized is None:
+            raise ValueError(f"Unsupported SD3.5 train method: {train_method}")
+        return normalized
+
+    def default_lr_for_method(self, train_method: str) -> float:
+        return 1e-4
+
+    def load_pipeline(self, config: ESDConfig):
+        
+        # Load the SD3 pipeline (which handles SD3.5 models)
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            config.base_model_id,
+            vae=None,  # Same optimization as Flux, sample latents directly
+            torch_dtype=config.torch_dtype,
+            use_safetensors=True,
+        ).to(config.device)
+        
+        if pipe.text_encoder is not None:
+            pipe.text_encoder.requires_grad_(False)
+        if pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.requires_grad_(False)
+        if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3.requires_grad_(False)
+            
+        return pipe
+
+    def build_metadata(self, config: ESDConfig) -> Dict[str, str]:
+        metadata = super().build_metadata(config)
+        metadata["max_sequence_length"] = str(config.max_sequence_length)
+        if config.inference_guidance_scale is not None:
+            metadata["inference_guidance_scale"] = str(config.inference_guidance_scale)
+        return metadata
+
+    def select_parameter_names(self, component: torch.nn.Module, train_method: str) -> list[str]:
+        # Targets the joint attention projection layers inside the MMDiT blocks
+        def selector(module_name: str) -> bool:
+            if train_method == "esd-x":
+                return "attn" in module_name
+            if train_method == "esd-x-strict":
+                return "attn" in module_name and ("to_k" in module_name or "to_v" in module_name)
+            return False
+
+        return select_parameter_names(component, selector)
+
+    def prepare_context(self, pipe, config: ESDConfig) -> Dict[str, Any]:
+        resolution = self.resolve_resolution(pipe, config)
+        
+        # Internal helper to handle single string inputs safely 
+        def get_batched_embeds(target_prompt: str):
+            with torch.no_grad():
+                embeds, pooled = pipe.encode_prompt(
+                    prompt=target_prompt,
+                    prompt_2=target_prompt,
+                    prompt_3=target_prompt,
+                    num_images_per_prompt=config.batch_size,
+                    max_sequence_length=config.max_sequence_length,
+                    device=config.device,
+                    do_classifier_free_guidance=False,
+                )
+            return embeds.to(config.device), pooled.to(config.device)
+
+        # Generate core prompt embeddings
+        erase_prompt_embeds, erase_pooled_prompt_embeds = get_batched_embeds(config.erase_concept)
+        null_prompt_embeds, null_pooled_prompt_embeds = get_batched_embeds("")
+
+        erase_from_prompt_embeds, erase_from_pooled_prompt_embeds = None, None
+        if config.erase_from is not None:
+            erase_from_prompt_embeds, erase_from_pooled_prompt_embeds = get_batched_embeds(config.erase_from)
+
+        # Offload text encoders immediately to preserve training VRAM
+        offload_modules_to_cpu(
+            config.device, 
+            pipe.text_encoder, 
+            getattr(pipe, "text_encoder_2", None), 
+            getattr(pipe, "text_encoder_3", None)
+        )
+
+        return {
+            "resolution": resolution,
+            "erase_prompt_embeds": erase_prompt_embeds,
+            "null_prompt_embeds": null_prompt_embeds,
+            "erase_from_prompt_embeds": erase_from_prompt_embeds,
+            "erase_pooled_prompt_embeds": erase_pooled_prompt_embeds,
+            "null_pooled_prompt_embeds": null_pooled_prompt_embeds,
+            "erase_from_pooled_prompt_embeds": erase_from_pooled_prompt_embeds,
+            
+            # Selection targets for the sampling forward loop
+            "sample_prompt_embeds": erase_prompt_embeds if erase_from_prompt_embeds is None else erase_from_prompt_embeds,
+            "sample_pooled_prompt_embeds": erase_pooled_prompt_embeds if erase_from_pooled_prompt_embeds is None else erase_from_pooled_prompt_embeds,
+            
+            # Selection targets for the student training step
+            "student_prompt_embeds": erase_prompt_embeds if erase_from_prompt_embeds is None else erase_from_prompt_embeds,
+            "student_pooled_prompt_embeds": erase_pooled_prompt_embeds if erase_from_pooled_prompt_embeds is None else erase_from_pooled_prompt_embeds,
+        }
+
+
+    def training_step(self, pipe, prepared: PreparedComponent, context: Dict[str, Any], config: ESDConfig) -> StepResult:
+        
+        run_till_timestep = random.randint(0, config.num_inference_steps - 1)
+        seed = random.randint(0, 2**15)
+
+        prepared.use_base()
+        prepared.component.eval()
+        
+        with torch.no_grad():
+            xt = esd_sd35_call(
+                pipe,
+                prompt_embeds=context["sample_prompt_embeds"],
+                pooled_prompt_embeds=context["sample_pooled_prompt_embeds"],
+                num_images_per_prompt=1,
+                num_inference_steps=config.num_inference_steps,
+                guidance_scale=config.guidance_scale,
+                max_sequence_length=config.max_sequence_length,
+                run_till_timestep=run_till_timestep,
+                generator=make_sampling_generator(config.device, seed),
+                output_type="latent",
+                height=context["resolution"],
+                width=context["resolution"],
+            ).images
+
+            timestep = pipe.scheduler.timesteps[run_till_timestep].unsqueeze(0).to(config.device)
+
+            noise_pred_null = prepared.component(
+                hidden_states=xt,
+                timestep=timestep,
+                encoder_hidden_states=context["null_prompt_embeds"],
+                pooled_projections=context["null_pooled_prompt_embeds"],
+                return_dict=False,
+            )[0] # Extract tensor out of single-element tuple output
+            
+            noise_pred_erase = prepared.component(
+                hidden_states=xt,
+                timestep=timestep,
+                encoder_hidden_states=context["erase_prompt_embeds"],
+                pooled_projections=context["erase_pooled_prompt_embeds"],
+                return_dict=False,
+            )[0]
+            
+            if context["erase_from_prompt_embeds"] is not None:
+                noise_pred_from = prepared.component(
+                    hidden_states=xt,
+                    timestep=timestep,
+                    encoder_hidden_states=context["erase_from_prompt_embeds"],
+                    pooled_projections=context["erase_from_pooled_prompt_embeds"],
+                    return_dict=False,
+                )[0]
+            else:
+                noise_pred_from = noise_pred_erase
+
+        prepared.use_student()
+        prepared.component.train()
+        
+        model_pred = prepared.component(
+            hidden_states=xt,
+            timestep=timestep,
+            encoder_hidden_states=context["student_prompt_embeds"],
+            pooled_projections=context["student_pooled_prompt_embeds"],
+            return_dict=False,
+        )[0]
+
+        target = noise_pred_from - config.negative_guidance * (noise_pred_erase - noise_pred_null)
+        return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
+
+
 ADAPTERS = {
     "sd": StableDiffusionESDAdapter(),
     "sdxl": StableDiffusionXLESDAdapter(),
     "flux": FluxESDAdapter(),
     "flux2_klein": Flux2KleinESDAdapter(),
+    "sd35": StableDiffusion35ESDAdapter(),  # <-- Added
 }
 
 
