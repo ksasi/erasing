@@ -1176,12 +1176,16 @@ class StableDiffusion35ESDAdapter(BaseESDAdapter):
         ).to(config.device)
         
         if pipe.text_encoder is not None:
+            pipe.text_encoder = pipe.text_encoder.to(config.device)
             pipe.text_encoder.requires_grad_(False)
         if pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2 = pipe.text_encoder_2.to(config.device)
             pipe.text_encoder_2.requires_grad_(False)
         if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3 = pipe.text_encoder_3.to(config.device)
             pipe.text_encoder_3.requires_grad_(False)
-            
+
+        pipe = pipe.to(config.device)    
         return pipe
 
     def build_metadata(self, config: ESDConfig) -> Dict[str, str]:
@@ -1208,7 +1212,7 @@ class StableDiffusion35ESDAdapter(BaseESDAdapter):
         # Internal helper to handle single string inputs safely 
         def get_batched_embeds(target_prompt: str):
             with torch.no_grad():
-                embeds, pooled = pipe.encode_prompt(
+                embeds, negative_prompt_embeds, pooled, negative_pooled_prompt_embeds = pipe.encode_prompt(
                     prompt=target_prompt,
                     prompt_2=target_prompt,
                     prompt_3=target_prompt,
