@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         required=True,
     )
-    parser.add_argument("--iterations", help="number of optimization steps", type=int, default=1000)
+    parser.add_argument("--iterations", help="number of optimization steps", type=int, default=1400)
     parser.add_argument(
         "--resolution",
         help="training resolution. Defaults to 512 to keep memory manageable.",

@@ -1163,7 +1163,7 @@ class StableDiffusion35ESDAdapter(BaseESDAdapter):
         return normalized
 
     def default_lr_for_method(self, train_method: str) -> float:
-        return 1e-4
+        return 5e-5
 
     def load_pipeline(self, config: ESDConfig):
         
@@ -1271,6 +1271,8 @@ class StableDiffusion35ESDAdapter(BaseESDAdapter):
                 pipe,
                 prompt_embeds=context["sample_prompt_embeds"],
                 pooled_prompt_embeds=context["sample_pooled_prompt_embeds"],
+                negative_prompt_embeds=context["null_prompt_embeds"],        # <-- Added
+                negative_pooled_prompt_embeds=context["null_pooled_prompt_embeds"], # <-- Added
                 num_images_per_prompt=1,
                 num_inference_steps=config.num_inference_steps,
                 guidance_scale=config.guidance_scale,
