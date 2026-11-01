@@ -715,7 +715,7 @@ class FluxESDAdapter(BaseESDAdapter):
         return normalized
 
     def default_lr_for_method(self, train_method: str) -> float:
-        return 5e-4
+        return 5e-5
 
     def load_pipeline(self, config: ESDConfig):
         # No VAE for ESD (unlike DreamBooth): training latents come only from the transformer
